@@ -9,7 +9,7 @@ WarSim 是一个命令行战役模拟器。战场宽度为 n，**每方可拥有
 Windows (MinGW):
 
 ```
-g++ -std=c++17 -O2 -finput-charset=UTF-8 -fexec-charset=GBK main.cpp sim.cpp io.cpp battle.cpp -o warsim.exe
+g++ -std=c++17 -O2 -finput-charset=UTF-8 -fexec-charset=GBK main.cpp sim.cpp io.cpp battle.cpp engine.cpp report.cpp simulation.cpp -o warsim.exe
 ```
 
 ### 运行
@@ -46,7 +46,7 @@ warsim.exe
 ## 主要公式
 
 - **基础伤害** = 攻击 × (1 + 训练度^0.5) × (满编率^0.8) × 战斗类型乘数
-- **命中率** = 攻击 / (攻击 + 闪避 × 命中k)
+- **命中率** = 进攻方闪避 / (受击方闪避 + 命中k)
 - **血量** = 士气 × (1 + 组织度/100) × (1 + 训练度^0.2) × (满编率^1.2)
 - **士气** = 基础士气 × 乘数 - 时间损耗 - 战中损耗
 - **预期战斗力** = 基础伤害 × 初始血量（用于兵种排序）
@@ -86,6 +86,28 @@ warsim.exe
 ### 修改全局参数（选项 3）
 - 运行时调整全部全局参数，即时生效。
 - 修改仅内存生效，不会写回 CSV。
+
+## 项目架构
+
+WarSim 由以下模块组成，职责清晰分离：
+
+| 文件 | 职责 |
+|---|---|
+| `types.hpp` | 数据结构定义（`SideInputs`, `Regiment`, `UnitState`, `RegimentReport`, 枚举等） |
+| `sim.hpp/cpp` | 公式与数值计算（伤害、命中、防御、士气、血量） |
+| `battle.hpp/cpp` | 布阵与横向补位逻辑（中轴线布局、`DeployResult`） |
+| `engine.hpp/cpp` | 战斗引擎（`run_battle_multi` 静默模式 + 报告收集） |
+| `report.hpp/cpp` | 输出与统计（兵种战报、胜负判定、百次测试） |
+| `simulation.hpp/cpp` | 交互式单次推演（逐回合详细战报 + 位置详情） |
+| `io.hpp/cpp` | 输入/菜单/CSV读取（`read_double`, `read_int`, `edit_global_menu`, `read_csv_params`） |
+| `main.cpp` | 程序入口 + 主菜单循环（仅调度与参数管理） |
+
+**数据流**：
+1. `main()` → `io::read_csv_params()` 读取 CSV → 按战斗力排序
+2. 菜单选择 → `simulation::run_single_simulation()` 或 `report::run_hundred_test()`
+3. 推演 → `battle::deploy_regiments()` 布阵 → `engine::run_battle_multi()` 战斗循环
+4. 公式计算 → `sim::simulate_round()` 等函数
+5. 结果输出 → `report::print_outcome()` / `print_regiment_reports()`
 
 ## 数据文件 (data.csv)
 
@@ -136,17 +158,6 @@ sideB,20,20,0,1,0,0,5,55,0,0,20
 | 时间损耗 | ≥0 | 每回合士气自然衰减 |
 | 战中损耗系数 | ≥0 | 每点承受伤害附加士气损耗 |
 | 队伍数 | ≥1 | 该兵种有多少个单位 |
-
-## 代码结构
-
-| 文件 | 职责 |
-|---|---|
-| `types.hpp` | 数据结构：`SideInputs`, `Regiment`, `UnitState`, `RegimentReport`, `DeployResult` 等 |
-| `sim.hpp / sim.cpp` | 公式计算：伤害、命中、防御、士气、血量、战斗力排序 |
-| `battle.hpp / battle.cpp` | 布阵引擎、横向补位、位形可视化（`deploy_regiments`） |
-| `io.hpp / io.cpp` | CSV 解析、菜单交互（`read_csv_params`, `edit_global_menu`） |
-| `main.cpp` | 主循环、多兵种战斗引擎（`run_battle_multi`）、百次测试 |
-| `data.csv` | 参数配置文件 |
 
 ## 开发备注
 
