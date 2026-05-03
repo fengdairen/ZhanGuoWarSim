@@ -35,6 +35,215 @@ static std::vector<int> build_backline(int width, int total_count) {
 	return backline;
 }
 
+struct BattleOutcome {
+	int a_remaining;
+	int b_remaining;
+};
+
+static BattleOutcome run_battle(
+	int battlefield_width,
+	int a_count,
+	int b_count,
+	const SideInputs& a,
+	const SideInputs& b,
+	const Multipliers& mult,
+	double hit_k,
+	int max_rounds,
+	double flank_multiplier,
+	FlankTargetMode flank_target_mode,
+	std::mt19937& rng
+) {
+	int a_front_count = std::min(battlefield_width, a_count);
+	int b_front_count = std::min(battlefield_width, b_count);
+	std::vector<int> a_positions = centered_positions(battlefield_width, a_front_count);
+	std::vector<int> b_positions = centered_positions(battlefield_width, b_front_count);
+	std::vector<UnitState> a_units = init_units(a, mult, battlefield_width, a_positions);
+	std::vector<UnitState> b_units = init_units(b, mult, battlefield_width, b_positions);
+	std::vector<int> a_backline = build_backline(battlefield_width, a_count);
+	std::vector<int> b_backline = build_backline(battlefield_width, b_count);
+	std::vector<int> a_empty_rounds(battlefield_width, 0);
+	std::vector<int> b_empty_rounds(battlefield_width, 0);
+
+	auto backline_total = [](const std::vector<int>& backline) {
+		int total = 0;
+		for (int value : backline) {
+			total += value;
+		}
+		return total;
+	};
+
+	auto apply_vertical_fill = [&](
+		std::vector<UnitState>& units,
+		std::vector<int>& backline,
+		std::vector<int>& empty_rounds,
+		const SideInputs& s
+	) {
+		for (int i = 0; i < static_cast<int>(units.size()); ++i) {
+			if (is_alive(units[i])) {
+				empty_rounds[i] = 0;
+				continue;
+			}
+			empty_rounds[i] += 1;
+			if (empty_rounds[i] >= 2 && backline[i] > 0) {
+				units[i] = initial_unit_state(s, mult);
+				units[i].hp *= 0.8;
+				backline[i] -= 1;
+				empty_rounds[i] = 0;
+			}
+		}
+	};
+
+	int last_a_total = a_count;
+	int last_b_total = b_count;
+
+	for (int round = 1; round <= max_rounds; ++round) {
+		apply_vertical_fill(a_units, a_backline, a_empty_rounds, a);
+		apply_vertical_fill(b_units, b_backline, b_empty_rounds, b);
+
+		apply_lateral_fill(a_units, b_units);
+		apply_lateral_fill(b_units, a_units);
+
+		std::vector<bool> a_alive_before(battlefield_width, false);
+		std::vector<bool> b_alive_before(battlefield_width, false);
+		for (int i = 0; i < battlefield_width; ++i) {
+			a_alive_before[i] = is_alive(a_units[i]);
+			b_alive_before[i] = is_alive(b_units[i]);
+		}
+
+		// 同位 1v1 互砍
+		for (int i = 0; i < battlefield_width; ++i) {
+			if (is_alive(a_units[i]) && is_alive(b_units[i])) {
+				RoundResult a_to_b = simulate_round(a, b, mult, hit_k, round, b_units[i].battle_loss_accum, rng);
+				RoundResult b_to_a = simulate_round(b, a, mult, hit_k, round, a_units[i].battle_loss_accum, rng);
+				b_units[i].hp -= a_to_b.damage_taken;
+				if (b_units[i].hp < 0.0) b_units[i].hp = 0.0;
+				a_units[i].hp -= b_to_a.damage_taken;
+				if (a_units[i].hp < 0.0) a_units[i].hp = 0.0;
+				b_units[i].battle_loss_accum += a_to_b.damage_taken * b.battle_loss_factor;
+				a_units[i].battle_loss_accum += b_to_a.damage_taken * a.battle_loss_factor;
+			}
+		}
+
+		// 夹击
+		auto has_adjacent_before = [&](const std::vector<bool>& alive_before, int index) {
+			for (int i = index - 1; i >= 0; --i) {
+				if (alive_before[i]) return true;
+			}
+			for (int i = index + 1; i < static_cast<int>(alive_before.size()); ++i) {
+				if (alive_before[i]) return true;
+			}
+			return false;
+		};
+
+		auto pick_target = [&](
+			const std::vector<UnitState>& defenders,
+			const SideInputs& defender_inputs,
+			int index
+		) {
+			auto is_alive_idx = [&](int idx) {
+				return idx >= 0 && idx < static_cast<int>(defenders.size()) && defenders[idx].hp > 0.0;
+			};
+			int left_pick = -1, right_pick = -1;
+			int left_dist = 0, right_dist = 0;
+			for (int i = index - 1; i >= 0; --i) {
+				if (is_alive_idx(i)) { left_pick = i; left_dist = index - i; break; }
+			}
+			for (int i = index + 1; i < static_cast<int>(defenders.size()); ++i) {
+				if (is_alive_idx(i)) { right_pick = i; right_dist = i - index; break; }
+			}
+			if (left_pick < 0 && right_pick < 0) return -1;
+			if (left_pick >= 0 && right_pick < 0) return left_pick;
+			if (left_pick < 0 && right_pick >= 0) return right_pick;
+			if (left_dist < right_dist) return left_pick;
+			if (right_dist < left_dist) return right_pick;
+			if (flank_target_mode == FlankTargetMode::Morale) {
+				double left_morale = unit_morale(defender_inputs, mult, round, defenders[left_pick]);
+				double right_morale = unit_morale(defender_inputs, mult, round, defenders[right_pick]);
+				return (left_morale <= right_morale) ? left_pick : right_pick;
+			}
+			return (defenders[left_pick].hp <= defenders[right_pick].hp) ? left_pick : right_pick;
+		};
+
+		for (int i = 0; i < battlefield_width; ++i) {
+			if (a_alive_before[i] && !b_alive_before[i] && has_adjacent_before(b_alive_before, i)) {
+				int target = pick_target(b_units, b, i);
+				if (target >= 0) {
+					RoundResult result = simulate_round(a, b, mult, hit_k, round, b_units[target].battle_loss_accum, rng);
+					result.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(target - i));
+					b_units[target].hp -= result.damage_taken;
+					if (b_units[target].hp < 0.0) b_units[target].hp = 0.0;
+					b_units[target].battle_loss_accum += result.damage_taken * b.battle_loss_factor;
+				}
+			}
+			if (b_alive_before[i] && !a_alive_before[i] && has_adjacent_before(a_alive_before, i)) {
+				int target = pick_target(a_units, a, i);
+				if (target >= 0) {
+					RoundResult result = simulate_round(b, a, mult, hit_k, round, a_units[target].battle_loss_accum, rng);
+					result.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(target - i));
+					a_units[target].hp -= result.damage_taken;
+					if (a_units[target].hp < 0.0) a_units[target].hp = 0.0;
+					a_units[target].battle_loss_accum += result.damage_taken * a.battle_loss_factor;
+				}
+			}
+		}
+
+		int a_front_alive = count_alive(a_units);
+		int b_front_alive = count_alive(b_units);
+		last_a_total = a_front_alive + backline_total(a_backline);
+		last_b_total = b_front_alive + backline_total(b_backline);
+
+		if (last_a_total == 0 || last_b_total == 0) {
+			break;
+		}
+	}
+
+	BattleOutcome outcome;
+	outcome.a_remaining = last_a_total;
+	outcome.b_remaining = last_b_total;
+	return outcome;
+}
+
+static void run_hundred_test(
+	int battlefield_width,
+	int a_count,
+	int b_count,
+	const SideInputs& a,
+	const SideInputs& b,
+	const Multipliers& mult,
+	double hit_k,
+	int max_rounds,
+	double flank_multiplier,
+	FlankTargetMode flank_target_mode,
+	std::mt19937& rng
+) {
+	const int NUM_TESTS = 100;
+	int a_wins = 0, b_wins = 0, draws = 0;
+	double sum_a_survivors = 0, sum_b_survivors = 0;
+
+	for (int test = 1; test <= NUM_TESTS; ++test) {
+		BattleOutcome outcome = run_battle(
+			battlefield_width, a_count, b_count,
+			a, b, mult, hit_k, max_rounds,
+			flank_multiplier, flank_target_mode, rng
+		);
+		sum_a_survivors += outcome.a_remaining;
+		sum_b_survivors += outcome.b_remaining;
+		if (outcome.a_remaining > 0 && outcome.b_remaining == 0) ++a_wins;
+		else if (outcome.b_remaining > 0 && outcome.a_remaining == 0) ++b_wins;
+		else ++draws;
+	}
+
+	std::cout << "\n========================================\n";
+	std::cout << "== 百次测试结果（" << NUM_TESTS << " 次） ==\n";
+	std::cout << "========================================\n";
+	std::cout << "  A 胜率: " << (a_wins * 100.0 / NUM_TESTS) << "%";
+	std::cout << "  平均残余: " << (sum_a_survivors / NUM_TESTS) << "\n";
+	std::cout << "  B 胜率: " << (b_wins * 100.0 / NUM_TESTS) << "%";
+	std::cout << "  平均残余: " << (sum_b_survivors / NUM_TESTS) << "\n";
+	std::cout << "  平局率: " << (draws * 100.0 / NUM_TESTS) << "%\n";
+	std::cout << "========================================\n";
+}
+
 int main() {
 	std::random_device rd;
 	std::mt19937 rng(rd());
@@ -94,9 +303,41 @@ int main() {
 	SideInputs a = read_side_inputs("Side A", default_a);
 	SideInputs b = read_side_inputs("Side B", default_b);
 
-	// ==== 回合推进 ====
+	// ==== 主循环 ====
 	bool keep_running = true;
 	while (keep_running) {
+		std::cout << "\n== 选择操作 ==\n";
+		std::cout << "1) 单次推演（逐回合查看战报）\n";
+		std::cout << "2) 百次测试（快速测试 100 场，输出胜率与平均残余）\n";
+		std::cout << "3) 修改全局参数\n";
+		std::cout << "4) 修改 Side A 参数\n";
+		std::cout << "5) 修改 Side B 参数\n";
+		std::cout << "0) 退出\n";
+
+		int init_choice = read_int("请选择", 1);
+		if (init_choice == 0) {
+			keep_running = false;
+			break;
+		}
+		if (init_choice == 2) {
+			run_hundred_test(battlefield_width, a_count, b_count,
+				a, b, mult, hit_k, max_rounds,
+				flank_multiplier, flank_target_mode, rng);
+			continue;
+		}
+		if (init_choice == 3) {
+			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode);
+			continue;
+		}
+		if (init_choice == 4) {
+			edit_side_menu(a);
+			continue;
+		}
+		if (init_choice == 5) {
+			edit_side_menu(b);
+			continue;
+		}
+
 		std::cout << "\n== 推演开始 ==\n";
 		std::cout << std::fixed << std::setprecision(4);
 
@@ -452,9 +693,10 @@ int main() {
 		std::cout << "\n== 推演结束 ==\n";
 		std::cout << "\n== 后续操作 ==\n";
 		std::cout << "1) 直接再次推演\n";
-		std::cout << "2) 修改全局参数\n";
-		std::cout << "3) 修改 Side A 参数\n";
-		std::cout << "4) 修改 Side B 参数\n";
+		std::cout << "2) 百次测试（快速测试 100 场，输出胜率与平均残余）\n";
+		std::cout << "3) 修改全局参数\n";
+		std::cout << "4) 修改 Side A 参数\n";
+		std::cout << "5) 修改 Side B 参数\n";
 		std::cout << "0) 退出\n";
 
 		int choice = read_int("请选择", 1);
@@ -462,12 +704,17 @@ int main() {
 		case 1:
 			break;
 		case 2:
-			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode);
+			run_hundred_test(battlefield_width, a_count, b_count,
+				a, b, mult, hit_k, max_rounds,
+				flank_multiplier, flank_target_mode, rng);
 			break;
 		case 3:
-			edit_side_menu(a);
+			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode);
 			break;
 		case 4:
+			edit_side_menu(a);
+			break;
+		case 5:
 			edit_side_menu(b);
 			break;
 		case 0:
