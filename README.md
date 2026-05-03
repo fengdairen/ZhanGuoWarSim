@@ -49,9 +49,9 @@ g++ -std=c++17 -O2 -finput-charset=UTF-8 -fexec-charset=GBK main.cpp sim.cpp io.
 
 ## 交互说明
 
-- 启动后可用一行快速输入全局参数：命中 k、战斗类型乘数、特殊情况乘数、最大回合数、战场宽度 n、A/B 队伍数量、夹击倍率；直接回车则逐项输入。
-- 之后分别输入 Side A / Side B 的队伍参数（可一行快速输入，也可逐项输入）。
-- 参数输入完毕后进入**主菜单**，可选择单次推演、百次测试、或修改参数。
+- 启动时自动从 `data.csv` 读取全部参数（全局参数 + SideA + SideB），无需手动输入。
+- 读取完毕后进入**主菜单**，可选择单次推演、百次测试、或修改参数。
+- **程序内修改参数仅内存生效，不会写回 CSV 文件**。如需持久化修改，请直接编辑 `data.csv`。
 
 ### 单次推演模式
 - 每回合输出简要战报（存活、阵亡、夹击统计）。
@@ -83,8 +83,44 @@ g++ -std=c++17 -O2 -finput-charset=UTF-8 -fexec-charset=GBK main.cpp sim.cpp io.
 - `main.cpp`: 主入口、回合循环、`run_battle()` 无交互战斗引擎、`run_hundred_test()` 百次测试。
 - `battle.cpp` / `battle.hpp`: 站位与横向补位逻辑、位形可视化。
 - `sim.cpp` / `sim.hpp`: 公式与战斗数值计算。
-- `io.cpp` / `io.hpp`: 输入与菜单交互。
+- `io.cpp` / `io.hpp`: 输入输出、菜单交互、CSV 读取。
 - `types.hpp`: 数据结构定义。
+- `data.csv`: 参数配置文件，程序启动时自动读取。
+
+## 数据文件 (data.csv)
+
+程序启动时自动读取同目录下的 `data.csv` 来初始化所有参数。CSV 格式为三列：
+
+```
+category,name,value
+```
+
+### 全局参数 (category = global)
+
+| 参数名称 | 说明 |
+|---|---|
+| `hit_k` | 命中公式分母常数 |
+| `battle_mult` / `special_mult` | 伤害与士气倍率 |
+| `max_rounds` | 超过该回合数强制结束 |
+| `battlefield_width` | 一维战场位置数 n |
+| `sideA_count` / `sideB_count` | 各方总单位数（含后排） |
+| `flank_mult` | 夹击伤害基础衰减系数 |
+| `flank_target` | 1=血量优先(Hp)，2=士气优先(Morale) |
+
+### SideA / SideB 参数 (category = sideA / sideB)
+
+| 参数名称 | 范围 | 说明 |
+|---|---|---|
+| `attack` | ≥0 | 基础攻击力 |
+| `evade` | ≥0 | 闪避值，影响命中率 |
+| `training` | 0-1 | 指数型收益 |
+| `full_rate` | 0-1 | 编制完整度 |
+| `armor_reduction` | 0-1 | 防御触发时的基础减伤 |
+| `defense_rate` | 0-1 | 触发防御判定的概率 |
+| `organization` | 0-100 | 线性加成血量 |
+| `base_morale` | ≥0 | 士气起点 |
+| `time_loss` | ≥0 | 每回合士气自然衰减 |
+| `battle_loss_factor` | ≥0 | 每点承受伤害附加士气损耗 |
 
 ## 开发备注
 

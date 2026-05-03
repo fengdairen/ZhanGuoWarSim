@@ -51,6 +51,7 @@ static BattleOutcome run_battle(
 	int max_rounds,
 	double flank_multiplier,
 	FlankTargetMode flank_target_mode,
+	int vertical_fill_delay,
 	std::mt19937& rng
 ) {
 	int a_front_count = std::min(battlefield_width, a_count);
@@ -84,7 +85,7 @@ static BattleOutcome run_battle(
 				continue;
 			}
 			empty_rounds[i] += 1;
-			if (empty_rounds[i] >= 2 && backline[i] > 0) {
+			if (empty_rounds[i] >= vertical_fill_delay && backline[i] > 0) {
 				units[i] = initial_unit_state(s, mult);
 				units[i].hp *= 0.8;
 				backline[i] -= 1;
@@ -214,6 +215,7 @@ static void run_hundred_test(
 	int max_rounds,
 	double flank_multiplier,
 	FlankTargetMode flank_target_mode,
+	int vertical_fill_delay,
 	std::mt19937& rng
 ) {
 	const int NUM_TESTS = 100;
@@ -224,7 +226,7 @@ static void run_hundred_test(
 		BattleOutcome outcome = run_battle(
 			battlefield_width, a_count, b_count,
 			a, b, mult, hit_k, max_rounds,
-			flank_multiplier, flank_target_mode, rng
+			flank_multiplier, flank_target_mode, vertical_fill_delay, rng
 		);
 		sum_a_survivors += outcome.a_remaining;
 		sum_b_survivors += outcome.b_remaining;
@@ -248,60 +250,28 @@ int main() {
 	std::random_device rd;
 	std::mt19937 rng(rd());
 
-	double hit_k = 10.0;
-	Multipliers mult;
-	mult.battle_type = 1.0;
-	mult.special = 1.0;
-	int max_rounds = 10;
-	int battlefield_width = 10;
-	int a_count = 3;
-	int b_count = 3;
-	double flank_multiplier = 0.4;
+	// 从 data.csv 读取参数
+	std::cout << "\n正在从 data.csv 读取参数...\n";
+	CsvParams csv = read_csv_params("data.csv");
 
-	std::cout << "\n== 全局参数（可快速输入） ==\n";
-	std::cout << "快速输入：命中 k 战斗类型乘数 特殊情况乘数 最大回合数 战场宽度 n A 队伍数量 B 队伍数量 夹击倍率\n";
-	std::cout << "直接回车则逐项输入。\n";
-	std::cout << "快速输入：";
-	std::string global_line;
-	std::getline(std::cin, global_line);
-	std::istringstream global_iss(global_line);
-	std::vector<double> global_values;
-	for (double value = 0.0; global_iss >> value;) {
-		global_values.push_back(value);
-	}
+	double hit_k = csv.hit_k;
+	Multipliers mult = csv.mult;
+	int max_rounds = csv.max_rounds;
+	int battlefield_width = csv.battlefield_width;
+	int a_count = csv.a_count;
+	int b_count = csv.b_count;
+	double flank_multiplier = csv.flank_multiplier;
+	FlankTargetMode flank_target_mode = csv.flank_target_mode;
+	int vertical_fill_delay = csv.vertical_fill_delay;
+	SideInputs a = csv.side_a;
+	SideInputs b = csv.side_b;
 
-	if (global_values.empty()) {
-		hit_k = read_double("命中公式 k", hit_k);
-		mult.battle_type = read_double("战斗类型乘数", mult.battle_type);
-		mult.special = read_double("特殊情况乘数", mult.special);
-		max_rounds = read_int("最大回合数", max_rounds);
-		battlefield_width = read_int("战场宽度 n", battlefield_width);
-		a_count = read_int("A 队伍数量", a_count);
-		b_count = read_int("B 队伍数量", b_count);
-		flank_multiplier = read_double("夹击倍率", flank_multiplier);
-	} else {
-		if (global_values.size() > 0) hit_k = global_values[0];
-		if (global_values.size() > 1) mult.battle_type = global_values[1];
-		if (global_values.size() > 2) mult.special = global_values[2];
-		if (global_values.size() > 3) max_rounds = static_cast<int>(global_values[3]);
-		if (global_values.size() > 4) battlefield_width = static_cast<int>(global_values[4]);
-		if (global_values.size() > 5) a_count = static_cast<int>(global_values[5]);
-		if (global_values.size() > 6) b_count = static_cast<int>(global_values[6]);
-		if (global_values.size() > 7) flank_multiplier = global_values[7];
-	}
-	FlankTargetMode flank_target_mode = FlankTargetMode::Hp;
 	max_rounds = std::max(1, max_rounds);
 	battlefield_width = std::max(1, battlefield_width);
 	a_count = clamp_non_negative(a_count);
 	b_count = clamp_non_negative(b_count);
 
-	SideInputs default_a;
-	SideInputs default_b;
-	default_a.name = "A";
-	default_b.name = "B";
-
-	SideInputs a = read_side_inputs("Side A", default_a);
-	SideInputs b = read_side_inputs("Side B", default_b);
+	std::cout << "已加载 " << a_count + b_count << " 个单位（A=" << a_count << " B=" << b_count << "），战场宽度=" << battlefield_width << "\n";
 
 	// ==== 主循环 ====
 	bool keep_running = true;
@@ -312,6 +282,7 @@ int main() {
 		std::cout << "3) 修改全局参数\n";
 		std::cout << "4) 修改 Side A 参数\n";
 		std::cout << "5) 修改 Side B 参数\n";
+		std::cout << "6) 重新读取 CSV（丢弃内存中的修改）\n";
 		std::cout << "0) 退出\n";
 
 		int init_choice = read_int("请选择", 1);
@@ -322,11 +293,11 @@ int main() {
 		if (init_choice == 2) {
 			run_hundred_test(battlefield_width, a_count, b_count,
 				a, b, mult, hit_k, max_rounds,
-				flank_multiplier, flank_target_mode, rng);
+				flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
 			continue;
 		}
 		if (init_choice == 3) {
-			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode);
+			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode, vertical_fill_delay);
 			continue;
 		}
 		if (init_choice == 4) {
@@ -337,7 +308,29 @@ int main() {
 			edit_side_menu(b);
 			continue;
 		}
+		if (init_choice == 6) {
+			std::cout << "重新读取 data.csv...\n";
+			CsvParams csv = read_csv_params("data.csv");
+			hit_k = csv.hit_k;
+			mult = csv.mult;
+			max_rounds = csv.max_rounds;
+			battlefield_width = csv.battlefield_width;
+			a_count = csv.a_count;
+			b_count = csv.b_count;
+			flank_multiplier = csv.flank_multiplier;
+			flank_target_mode = csv.flank_target_mode;
+			vertical_fill_delay = csv.vertical_fill_delay;
+			a = csv.side_a;
+			b = csv.side_b;
+			max_rounds = std::max(1, max_rounds);
+			battlefield_width = std::max(1, battlefield_width);
+			a_count = clamp_non_negative(a_count);
+			b_count = clamp_non_negative(b_count);
+			std::cout << "已重新加载（A=" << a_count << " B=" << b_count << "，战场宽度=" << battlefield_width << "）\n";
+			continue;
+		}
 
+		// 默认（含选项 1）：单次推演
 		std::cout << "\n== 推演开始 ==\n";
 		std::cout << std::fixed << std::setprecision(4);
 
@@ -395,7 +388,7 @@ int main() {
 						continue;
 					}
 					empty_rounds[i] += 1;
-					if (empty_rounds[i] >= 2 && backline[i] > 0) {
+					if (empty_rounds[i] >= vertical_fill_delay && backline[i] > 0) {
 						units[i] = initial_unit_state(s, mult);
 						units[i].hp *= 0.8;
 						backline[i] -= 1;
@@ -706,10 +699,10 @@ int main() {
 		case 2:
 			run_hundred_test(battlefield_width, a_count, b_count,
 				a, b, mult, hit_k, max_rounds,
-				flank_multiplier, flank_target_mode, rng);
+				flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
 			break;
 		case 3:
-			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode);
+			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode, vertical_fill_delay);
 			break;
 		case 4:
 			edit_side_menu(a);

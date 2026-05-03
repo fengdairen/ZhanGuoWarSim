@@ -1,6 +1,7 @@
 #include "io.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -211,7 +212,8 @@ void edit_global_menu(
 	int& a_count,
 	int& b_count,
 	double& flank_multiplier,
-	FlankTargetMode& flank_target_mode
+	FlankTargetMode& flank_target_mode,
+	int& vertical_fill_delay
 ) {
 	while (true) {
 		std::cout << "\n== 修改全局参数 ==\n";
@@ -224,6 +226,7 @@ void edit_global_menu(
 			<< " B 队伍数量=" << b_count
 			<< " 夹击倍率=" << flank_multiplier
 			<< " 夹击目标=" << flank_target_mode_label(flank_target_mode)
+			<< " 纵向补位延迟=" << vertical_fill_delay
 			<< "\n";
 		std::cout << "1) 命中公式 k\n";
 		std::cout << "2) 战斗类型乘数\n";
@@ -234,6 +237,7 @@ void edit_global_menu(
 		std::cout << "7) B 队伍数量\n";
 		std::cout << "8) 夹击倍率\n";
 		std::cout << "9) 夹击目标（1 血量 / 2 士气）\n";
+		std::cout << "10) 纵向补位延迟（空位持续回合数）\n";
 		std::cout << "0) 返回\n";
 
 		int choice = read_int("选择要修改的项目", 0);
@@ -268,6 +272,9 @@ void edit_global_menu(
 			flank_target_mode = (value == 2) ? FlankTargetMode::Morale : FlankTargetMode::Hp;
 			break;
 		}
+		case 10:
+			vertical_fill_delay = std::max(1, read_int("纵向补位延迟（空位持续回合数）", vertical_fill_delay));
+			break;
 		case 0:
 			return;
 		default:
@@ -289,4 +296,96 @@ std::vector<int> parse_indices(const std::string& line, int max_index) {
 		}
 	}
 	return result;
+}
+
+// ==== CSV 读取 ====
+
+CsvParams read_csv_params(const std::string& filepath) {
+	CsvParams params;
+	params.side_a.name = "A";
+	params.side_b.name = "B";
+
+	std::ifstream file(filepath);
+	if (!file.is_open()) {
+		std::cerr << "警告：无法打开 " << filepath << "，将使用默认参数。\n";
+		return params;
+	}
+
+	std::string line;
+	// 跳过表头
+	std::getline(file, line);
+
+	auto trim = [](std::string& s) {
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) s.erase(s.begin());
+		while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+	};
+
+	while (std::getline(file, line)) {
+		if (line.empty()) continue;
+		std::istringstream iss(line);
+		std::string category, name, val_str;
+		std::getline(iss, category, ',');
+		std::getline(iss, name, ',');
+		std::getline(iss, val_str, ',');
+		trim(category);
+		trim(name);
+		trim(val_str);
+		if (name.empty() || val_str.empty()) continue;
+
+		double value = 0.0;
+		try {
+			value = std::stod(val_str);
+		} catch (...) {
+			std::cerr << "警告：CSV 行 \"" << line << "\" 数值格式无效，已跳过。\n";
+			continue;
+		}
+
+		if (category == "global") {
+			if (name == "hit_k") params.hit_k = value;
+			else if (name == "battle_mult") params.mult.battle_type = value;
+			else if (name == "special_mult") params.mult.special = value;
+			else if (name == "max_rounds") params.max_rounds = static_cast<int>(value);
+			else if (name == "battlefield_width") params.battlefield_width = static_cast<int>(value);
+			else if (name == "sideA_count") params.a_count = static_cast<int>(value);
+			else if (name == "sideB_count") params.b_count = static_cast<int>(value);
+			else if (name == "flank_mult") params.flank_multiplier = value;
+			else if (name == "flank_target") {
+				params.flank_target_mode = (static_cast<int>(value) == 2) ? FlankTargetMode::Morale : FlankTargetMode::Hp;
+			}
+			else if (name == "fill_delay") params.vertical_fill_delay = static_cast<int>(value);
+		} else if (category == "sideA") {
+			if (name == "attack") params.side_a.attack = value;
+			else if (name == "evade") params.side_a.evade = value;
+			else if (name == "training") params.side_a.training = value;
+			else if (name == "full_rate") params.side_a.full_rate = value;
+			else if (name == "armor_reduction") params.side_a.armor_reduction = value;
+			else if (name == "defense_rate") params.side_a.defense_rate = value;
+			else if (name == "organization") params.side_a.organization = value;
+			else if (name == "base_morale") params.side_a.base_morale = value;
+			else if (name == "time_loss") params.side_a.time_loss_per_round = value;
+			else if (name == "battle_loss_factor") params.side_a.battle_loss_factor = value;
+		} else if (category == "sideB") {
+			if (name == "attack") params.side_b.attack = value;
+			else if (name == "evade") params.side_b.evade = value;
+			else if (name == "training") params.side_b.training = value;
+			else if (name == "full_rate") params.side_b.full_rate = value;
+			else if (name == "armor_reduction") params.side_b.armor_reduction = value;
+			else if (name == "defense_rate") params.side_b.defense_rate = value;
+			else if (name == "organization") params.side_b.organization = value;
+			else if (name == "base_morale") params.side_b.base_morale = value;
+			else if (name == "time_loss") params.side_b.time_loss_per_round = value;
+			else if (name == "battle_loss_factor") params.side_b.battle_loss_factor = value;
+		}
+	}
+
+	// 值域裁剪（与 read_side_inputs 保持一致）
+	for (SideInputs* s : { &params.side_a, &params.side_b }) {
+		s->training = clamp01(s->training);
+		s->full_rate = clamp01(s->full_rate);
+		s->armor_reduction = clamp01(s->armor_reduction);
+		s->defense_rate = clamp01(s->defense_rate);
+		s->organization = clamp_range(s->organization, 0.0, 100.0);
+	}
+
+	return params;
 }
