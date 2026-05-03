@@ -9,17 +9,12 @@
 
 double read_double(const std::string& prompt, double default_value);
 int read_int(const std::string& prompt, int default_value);
-SideInputs read_side_inputs(const std::string& name, const SideInputs& defaults);
 
-void print_side_summary(const SideInputs& s);
-void edit_side_menu(SideInputs& s);
 void edit_global_menu(
 	double& hit_k,
 	Multipliers& mult,
 	int& max_rounds,
 	int& battlefield_width,
-	int& a_count,
-	int& b_count,
 	double& flank_multiplier,
 	FlankTargetMode& flank_target_mode,
 	int& vertical_fill_delay
@@ -35,13 +30,11 @@ struct CsvParams {
 	Multipliers mult;
 	int max_rounds = 10;
 	int battlefield_width = 10;
-	int a_count = 3;
-	int b_count = 3;
 	double flank_multiplier = 0.4;
 	FlankTargetMode flank_target_mode = FlankTargetMode::Hp;
 	int vertical_fill_delay = 2;
-	SideInputs side_a;
-	SideInputs side_b;
+	std::vector<Regiment> side_a_regiments;
+	std::vector<Regiment> side_b_regiments;
 };
 
 CsvParams read_csv_params(const std::string& filepath);

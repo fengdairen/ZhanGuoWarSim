@@ -19,15 +19,16 @@ double calc_morale(const SideInputs& s, const Multipliers& m, int round, double 
 double calc_hp(double morale, const SideInputs& s);
 double unit_morale(const SideInputs& s, const Multipliers& m, int round, const UnitState& u);
 
+// 兵种预期战斗力 = 基础伤害 × 初始血量
+double calc_expected_power(const SideInputs& s, const Multipliers& m);
+// 按预期战斗力降序排序
+void sort_regiments_by_power(std::vector<Regiment>& regiments, const Multipliers& m);
+
 bool is_alive(const UnitState& u);
 int count_alive(const std::vector<UnitState>& units);
-std::vector<UnitState> init_units(
-	const SideInputs& s,
-	const Multipliers& m,
-	int width,
-	const std::vector<int>& positions
-);
-UnitState initial_unit_state(const SideInputs& s, const Multipliers& m);
+int total_regiment_count(const std::vector<Regiment>& regiments);
+
+UnitState initial_unit_state(const SideInputs& s, const Multipliers& m, int regiment_idx);
 
 double flank_damage_multiplier(double base_multiplier, int distance);
 

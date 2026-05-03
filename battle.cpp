@@ -1,6 +1,7 @@
 #include "battle.hpp"
 
 #include <algorithm>
+#include <queue>
 
 #include "sim.hpp"
 
@@ -104,4 +105,50 @@ std::string alive_line(const std::vector<UnitState>& units) {
 		line.push_back(is_alive(u) ? '1' : '0');
 	}
 	return line;
+}
+
+DeployResult deploy_regiments(
+	const std::vector<Regiment>& regiments,
+	const Multipliers& mult,
+	int battlefield_width
+) {
+	DeployResult result;
+
+	// 1. 展开：生成展平列表（按战斗力降序，regiments 外部已排序）
+	//    flattened[i] = regiment_idx 表示这个单位的兵种归属
+	std::vector<int> flattened;
+	for (int r = 0; r < static_cast<int>(regiments.size()); ++r) {
+		for (int i = 0; i < regiments[r].count; ++i) {
+			flattened.push_back(r);
+		}
+	}
+
+	int total_units = static_cast<int>(flattened.size());
+
+	// 2. 分配前排位置
+	result.front_units.resize(battlefield_width);
+	int front_count = std::min(battlefield_width, total_units);
+	std::vector<int> front_positions = centered_positions(battlefield_width, front_count);
+
+	// 按战斗力从高到低占中轴线附近的坑
+	for (int i = 0; i < front_count; ++i) {
+		int pos = front_positions[i];
+		int reg_idx = flattened[i];
+		result.front_units[pos] = initial_unit_state(regiments[reg_idx].stats, mult, reg_idx);
+	}
+
+	// 3. 分配后排队列
+	result.backline_queue.resize(battlefield_width);
+	if (total_units > battlefield_width) {
+		// 剩余单位按 center_out_order 分配到各位置的后排队列
+		std::vector<int> order = center_out_order(battlefield_width);
+		int idx = 0;
+		for (int i = battlefield_width; i < total_units; ++i) {
+			int pos = order[idx % battlefield_width];
+			result.backline_queue[pos].push_back(flattened[i]);
+			++idx;
+		}
+	}
+
+	return result;
 }

@@ -11,28 +11,14 @@
 #include "io.hpp"
 #include "sim.hpp"
 
-static int clamp_non_negative(int count) {
-	return std::max(0, count);
+static const SideInputs& get_side_inputs(const std::vector<Regiment>& regs, int idx) {
+	return regs[idx].stats;
 }
 
-static std::vector<int> build_backline(int width, int total_count) {
-	std::vector<int> backline(width, 0);
-	if (width <= 0) {
-		return backline;
-	}
-	int front_count = std::min(width, total_count);
-	int remaining = total_count - front_count;
-	if (remaining <= 0) {
-		return backline;
-	}
-	std::vector<int> order = center_out_order(width);
-	int idx = 0;
-	while (remaining > 0) {
-		backline[order[idx % width]] += 1;
-		--remaining;
-		++idx;
-	}
-	return backline;
+static int backline_queue_total(const std::vector<std::vector<int>>& queues) {
+	int total = 0;
+	for (const auto& q : queues) total += static_cast<int>(q.size());
+	return total;
 }
 
 struct BattleOutcome {
@@ -40,70 +26,70 @@ struct BattleOutcome {
 	int b_remaining;
 };
 
-static BattleOutcome run_battle(
+// 多兵种战斗引擎（同时收集兵种战报）
+static BattleOutcome run_battle_multi(
 	int battlefield_width,
-	int a_count,
-	int b_count,
-	const SideInputs& a,
-	const SideInputs& b,
+	const std::vector<Regiment>& a_regiments,
+	const std::vector<Regiment>& b_regiments,
 	const Multipliers& mult,
 	double hit_k,
 	int max_rounds,
 	double flank_multiplier,
 	FlankTargetMode flank_target_mode,
 	int vertical_fill_delay,
-	std::mt19937& rng
+	std::mt19937& rng,
+	std::vector<RegimentReport>* a_reports_out = nullptr,
+	std::vector<RegimentReport>* b_reports_out = nullptr
 ) {
-	int a_front_count = std::min(battlefield_width, a_count);
-	int b_front_count = std::min(battlefield_width, b_count);
-	std::vector<int> a_positions = centered_positions(battlefield_width, a_front_count);
-	std::vector<int> b_positions = centered_positions(battlefield_width, b_front_count);
-	std::vector<UnitState> a_units = init_units(a, mult, battlefield_width, a_positions);
-	std::vector<UnitState> b_units = init_units(b, mult, battlefield_width, b_positions);
-	std::vector<int> a_backline = build_backline(battlefield_width, a_count);
-	std::vector<int> b_backline = build_backline(battlefield_width, b_count);
+	DeployResult a_deploy = deploy_regiments(a_regiments, mult, battlefield_width);
+	DeployResult b_deploy = deploy_regiments(b_regiments, mult, battlefield_width);
+	std::vector<UnitState> a_units = std::move(a_deploy.front_units);
+	std::vector<UnitState> b_units = std::move(b_deploy.front_units);
+	std::vector<std::vector<int>> a_backline = std::move(a_deploy.backline_queue);
+	std::vector<std::vector<int>> b_backline = std::move(b_deploy.backline_queue);
 	std::vector<int> a_empty_rounds(battlefield_width, 0);
 	std::vector<int> b_empty_rounds(battlefield_width, 0);
 
-	auto backline_total = [](const std::vector<int>& backline) {
-		int total = 0;
-		for (int value : backline) {
-			total += value;
-		}
-		return total;
-	};
+	// 初始化兵种报告
+	std::vector<RegimentReport> a_reports, b_reports;
+	for (int r = 0; r < static_cast<int>(a_regiments.size()); ++r) {
+		a_reports.push_back({ "A#" + std::to_string(r + 1), a_regiments[r].count, 0, 0.0 });
+	}
+	for (int r = 0; r < static_cast<int>(b_regiments.size()); ++r) {
+		b_reports.push_back({ "B#" + std::to_string(r + 1), b_regiments[r].count, 0, 0.0 });
+	}
 
-	auto apply_vertical_fill = [&](
-		std::vector<UnitState>& units,
-		std::vector<int>& backline,
-		std::vector<int>& empty_rounds,
-		const SideInputs& s
-	) {
-		for (int i = 0; i < static_cast<int>(units.size()); ++i) {
-			if (is_alive(units[i])) {
-				empty_rounds[i] = 0;
-				continue;
-			}
-			empty_rounds[i] += 1;
-			if (empty_rounds[i] >= vertical_fill_delay && backline[i] > 0) {
-				units[i] = initial_unit_state(s, mult);
-				units[i].hp *= 0.8;
-				backline[i] -= 1;
-				empty_rounds[i] = 0;
-			}
-		}
-	};
-
-	int last_a_total = a_count;
-	int last_b_total = b_count;
+	auto get_a_inputs = [&](int reg_idx) -> const SideInputs& { return a_regiments[reg_idx].stats; };
+	auto get_b_inputs = [&](int reg_idx) -> const SideInputs& { return b_regiments[reg_idx].stats; };
 
 	for (int round = 1; round <= max_rounds; ++round) {
-		apply_vertical_fill(a_units, a_backline, a_empty_rounds, a);
-		apply_vertical_fill(b_units, b_backline, b_empty_rounds, b);
+		// ----- 纵向补位 -----
+		auto apply_vertical_fill = [&](
+			std::vector<UnitState>& units,
+			std::vector<std::vector<int>>& backline,
+			std::vector<int>& empty_rounds,
+			const std::vector<Regiment>& regs
+		) {
+			for (int i = 0; i < static_cast<int>(units.size()); ++i) {
+				if (is_alive(units[i])) { empty_rounds[i] = 0; continue; }
+				empty_rounds[i] += 1;
+				if (empty_rounds[i] >= vertical_fill_delay && !backline[i].empty()) {
+					int reg_idx = backline[i].front();
+					backline[i].erase(backline[i].begin());
+					units[i] = initial_unit_state(regs[reg_idx].stats, mult, reg_idx);
+					units[i].hp *= 0.8;
+					empty_rounds[i] = 0;
+				}
+			}
+		};
+		apply_vertical_fill(a_units, a_backline, a_empty_rounds, a_regiments);
+		apply_vertical_fill(b_units, b_backline, b_empty_rounds, b_regiments);
 
+		// ----- 横向补位 -----
 		apply_lateral_fill(a_units, b_units);
 		apply_lateral_fill(b_units, a_units);
 
+		// 快照战斗前状态
 		std::vector<bool> a_alive_before(battlefield_width, false);
 		std::vector<bool> b_alive_before(battlefield_width, false);
 		for (int i = 0; i < battlefield_width; ++i) {
@@ -111,105 +97,160 @@ static BattleOutcome run_battle(
 			b_alive_before[i] = is_alive(b_units[i]);
 		}
 
-		// 同位 1v1 互砍
+		// ----- 同位 1v1 互砍 -----
 		for (int i = 0; i < battlefield_width; ++i) {
-			if (is_alive(a_units[i]) && is_alive(b_units[i])) {
-				RoundResult a_to_b = simulate_round(a, b, mult, hit_k, round, b_units[i].battle_loss_accum, rng);
-				RoundResult b_to_a = simulate_round(b, a, mult, hit_k, round, a_units[i].battle_loss_accum, rng);
-				b_units[i].hp -= a_to_b.damage_taken;
-				if (b_units[i].hp < 0.0) b_units[i].hp = 0.0;
-				a_units[i].hp -= b_to_a.damage_taken;
-				if (a_units[i].hp < 0.0) a_units[i].hp = 0.0;
-				b_units[i].battle_loss_accum += a_to_b.damage_taken * b.battle_loss_factor;
-				a_units[i].battle_loss_accum += b_to_a.damage_taken * a.battle_loss_factor;
-			}
+			if (!is_alive(a_units[i]) || !is_alive(b_units[i])) continue;
+			int a_reg = a_units[i].regiment_idx;
+			int b_reg = b_units[i].regiment_idx;
+			const SideInputs& a_s = get_a_inputs(a_reg);
+			const SideInputs& b_s = get_b_inputs(b_reg);
+
+			RoundResult a_to_b = simulate_round(a_s, b_s, mult, hit_k, round, b_units[i].battle_loss_accum, rng);
+			RoundResult b_to_a = simulate_round(b_s, a_s, mult, hit_k, round, a_units[i].battle_loss_accum, rng);
+
+			b_units[i].hp -= a_to_b.damage_taken;
+			if (b_units[i].hp < 0.0) b_units[i].hp = 0.0;
+			a_units[i].hp -= b_to_a.damage_taken;
+			if (a_units[i].hp < 0.0) a_units[i].hp = 0.0;
+
+			b_units[i].battle_loss_accum += a_to_b.damage_taken * b_s.battle_loss_factor;
+			a_units[i].battle_loss_accum += b_to_a.damage_taken * a_s.battle_loss_factor;
+
+			if (a_reg >= 0 && a_reg < static_cast<int>(a_reports.size()))
+				a_reports[a_reg].damage_dealt += a_to_b.damage_taken;
+			if (b_reg >= 0 && b_reg < static_cast<int>(b_reports.size()))
+				b_reports[b_reg].damage_dealt += b_to_a.damage_taken;
 		}
 
-		// 夹击
-		auto has_adjacent_before = [&](const std::vector<bool>& alive_before, int index) {
-			for (int i = index - 1; i >= 0; --i) {
-				if (alive_before[i]) return true;
-			}
-			for (int i = index + 1; i < static_cast<int>(alive_before.size()); ++i) {
-				if (alive_before[i]) return true;
-			}
+		// ----- 夹击 -----
+		auto has_adjacent_before = [&](const std::vector<bool>& alive_before, int idx) {
+			for (int j = idx - 1; j >= 0; --j) if (alive_before[j]) return true;
+			for (int j = idx + 1; j < static_cast<int>(alive_before.size()); ++j) if (alive_before[j]) return true;
 			return false;
 		};
-
-		auto pick_target = [&](
-			const std::vector<UnitState>& defenders,
-			const SideInputs& defender_inputs,
-			int index
-		) {
-			auto is_alive_idx = [&](int idx) {
-				return idx >= 0 && idx < static_cast<int>(defenders.size()) && defenders[idx].hp > 0.0;
-			};
-			int left_pick = -1, right_pick = -1;
-			int left_dist = 0, right_dist = 0;
-			for (int i = index - 1; i >= 0; --i) {
-				if (is_alive_idx(i)) { left_pick = i; left_dist = index - i; break; }
-			}
-			for (int i = index + 1; i < static_cast<int>(defenders.size()); ++i) {
-				if (is_alive_idx(i)) { right_pick = i; right_dist = i - index; break; }
-			}
-			if (left_pick < 0 && right_pick < 0) return -1;
-			if (left_pick >= 0 && right_pick < 0) return left_pick;
-			if (left_pick < 0 && right_pick >= 0) return right_pick;
-			if (left_dist < right_dist) return left_pick;
-			if (right_dist < left_dist) return right_pick;
+		auto pick_target = [&](const std::vector<UnitState>& defenders, const std::vector<Regiment>& def_regs, int idx) {
+			auto is_alive_idx = [&](int j) { return j >= 0 && j < static_cast<int>(defenders.size()) && defenders[j].hp > 0.0; };
+			int lp = -1, rp = -1, ld = 0, rd = 0;
+			for (int j = idx - 1; j >= 0; --j) if (is_alive_idx(j)) { lp = j; ld = idx - j; break; }
+			for (int j = idx + 1; j < static_cast<int>(defenders.size()); ++j) if (is_alive_idx(j)) { rp = j; rd = j - idx; break; }
+			if (lp < 0 && rp < 0) return -1;
+			if (lp >= 0 && rp < 0) return lp;
+			if (lp < 0 && rp >= 0) return rp;
+			if (ld < rd) return lp;
+			if (rd < ld) return rp;
 			if (flank_target_mode == FlankTargetMode::Morale) {
-				double left_morale = unit_morale(defender_inputs, mult, round, defenders[left_pick]);
-				double right_morale = unit_morale(defender_inputs, mult, round, defenders[right_pick]);
-				return (left_morale <= right_morale) ? left_pick : right_pick;
+				const SideInputs& ls = get_side_inputs(def_regs, defenders[lp].regiment_idx);
+				const SideInputs& rs = get_side_inputs(def_regs, defenders[rp].regiment_idx);
+				double lm = unit_morale(ls, mult, round, defenders[lp]);
+				double rm = unit_morale(rs, mult, round, defenders[rp]);
+				return (lm <= rm) ? lp : rp;
 			}
-			return (defenders[left_pick].hp <= defenders[right_pick].hp) ? left_pick : right_pick;
+			return (defenders[lp].hp <= defenders[rp].hp) ? lp : rp;
 		};
 
+		// A 夹击 B
 		for (int i = 0; i < battlefield_width; ++i) {
 			if (a_alive_before[i] && !b_alive_before[i] && has_adjacent_before(b_alive_before, i)) {
-				int target = pick_target(b_units, b, i);
-				if (target >= 0) {
-					RoundResult result = simulate_round(a, b, mult, hit_k, round, b_units[target].battle_loss_accum, rng);
-					result.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(target - i));
-					b_units[target].hp -= result.damage_taken;
-					if (b_units[target].hp < 0.0) b_units[target].hp = 0.0;
-					b_units[target].battle_loss_accum += result.damage_taken * b.battle_loss_factor;
-				}
+				int target = pick_target(b_units, b_regiments, i);
+				if (target < 0) continue;
+				int a_reg = a_units[i].regiment_idx;
+				int b_reg = b_units[target].regiment_idx;
+				const SideInputs& a_s = get_a_inputs(a_reg);
+				const SideInputs& b_s = get_b_inputs(b_reg);
+				RoundResult result = simulate_round(a_s, b_s, mult, hit_k, round, b_units[target].battle_loss_accum, rng);
+				result.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(target - i));
+				b_units[target].hp -= result.damage_taken;
+				if (b_units[target].hp < 0.0) b_units[target].hp = 0.0;
+				b_units[target].battle_loss_accum += result.damage_taken * b_s.battle_loss_factor;
+				if (a_reg >= 0 && a_reg < static_cast<int>(a_reports.size()))
+					a_reports[a_reg].damage_dealt += result.damage_taken;
 			}
+		}
+		// B 夹击 A
+		for (int i = 0; i < battlefield_width; ++i) {
 			if (b_alive_before[i] && !a_alive_before[i] && has_adjacent_before(a_alive_before, i)) {
-				int target = pick_target(a_units, a, i);
-				if (target >= 0) {
-					RoundResult result = simulate_round(b, a, mult, hit_k, round, a_units[target].battle_loss_accum, rng);
-					result.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(target - i));
-					a_units[target].hp -= result.damage_taken;
-					if (a_units[target].hp < 0.0) a_units[target].hp = 0.0;
-					a_units[target].battle_loss_accum += result.damage_taken * a.battle_loss_factor;
-				}
+				int target = pick_target(a_units, a_regiments, i);
+				if (target < 0) continue;
+				int b_reg = b_units[i].regiment_idx;
+				int a_reg = a_units[target].regiment_idx;
+				const SideInputs& b_s = get_b_inputs(b_reg);
+				const SideInputs& a_s = get_a_inputs(a_reg);
+				RoundResult result = simulate_round(b_s, a_s, mult, hit_k, round, a_units[target].battle_loss_accum, rng);
+				result.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(target - i));
+				a_units[target].hp -= result.damage_taken;
+				if (a_units[target].hp < 0.0) a_units[target].hp = 0.0;
+				a_units[target].battle_loss_accum += result.damage_taken * a_s.battle_loss_factor;
+				if (b_reg >= 0 && b_reg < static_cast<int>(b_reports.size()))
+					b_reports[b_reg].damage_dealt += result.damage_taken;
 			}
 		}
 
-		int a_front_alive = count_alive(a_units);
-		int b_front_alive = count_alive(b_units);
-		last_a_total = a_front_alive + backline_total(a_backline);
-		last_b_total = b_front_alive + backline_total(b_backline);
-
-		if (last_a_total == 0 || last_b_total == 0) {
-			break;
+		// 统计阵亡
+		for (int i = 0; i < battlefield_width; ++i) {
+			if (a_alive_before[i] && !is_alive(a_units[i])) {
+				int r = a_units[i].regiment_idx;
+				if (r >= 0 && r < static_cast<int>(a_reports.size())) a_reports[r].deaths += 1;
+			}
+			if (b_alive_before[i] && !is_alive(b_units[i])) {
+				int r = b_units[i].regiment_idx;
+				if (r >= 0 && r < static_cast<int>(b_reports.size())) b_reports[r].deaths += 1;
+			}
 		}
+
+		// 检查全灭
+		int a_total = count_alive(a_units) + backline_queue_total(a_backline);
+		int b_total = count_alive(b_units) + backline_queue_total(b_backline);
+		if (a_total == 0 || b_total == 0) break;
 	}
 
-	BattleOutcome outcome;
-	outcome.a_remaining = last_a_total;
-	outcome.b_remaining = last_b_total;
-	return outcome;
+	if (a_reports_out) *a_reports_out = std::move(a_reports);
+	if (b_reports_out) *b_reports_out = std::move(b_reports);
+
+	int a_total = count_alive(a_units) + backline_queue_total(a_backline);
+	int b_total = count_alive(b_units) + backline_queue_total(b_backline);
+	return { a_total, b_total };
 }
 
+// ===== 打印兵种战报 =====
+static void print_regiment_reports(
+	const std::string& side_name,
+	const std::vector<Regiment>& regiments,
+	const std::vector<RegimentReport>& reports
+) {
+	std::cout << "=== " << side_name << " 兵种战报 ===\n";
+	for (int r = 0; r < static_cast<int>(regiments.size()); ++r) {
+		const auto& reg = regiments[r];
+		const auto& rep = reports[r];
+		int alive = rep.initial_count - rep.deaths;
+		std::cout << "  " << rep.label
+			<< " (攻=" << reg.stats.attack
+			<< " 闪=" << reg.stats.evade
+			<< " 训=" << reg.stats.training
+			<< " 甲=" << reg.stats.armor_reduction
+			<< " 士气=" << reg.stats.base_morale
+			<< "): 初始=" << rep.initial_count
+			<< " 阵亡=" << rep.deaths
+			<< " 存活=" << alive
+			<< " 造成伤害=" << std::fixed << std::setprecision(1) << rep.damage_dealt << "\n";
+	}
+}
+
+// ===== 打印战斗结果 =====
+static void print_outcome(int a_total, int b_total, bool time_up) {
+	if (time_up) std::cout << "\n== 时间结束 ==\n";
+	if (a_total == 0 && b_total == 0)       std::cout << "结果：平局（双方死绝）\n";
+	else if (a_total == 0)                  std::cout << "结果：B 胜利\n";
+	else if (b_total == 0)                  std::cout << "结果：A 胜利\n";
+	else if (a_total > b_total)             std::cout << "结果：A 胜利\n";
+	else if (b_total > a_total)             std::cout << "结果：B 胜利\n";
+	else                                    std::cout << "结果：平局\n";
+}
+
+// ===== 百次测试 =====
 static void run_hundred_test(
 	int battlefield_width,
-	int a_count,
-	int b_count,
-	const SideInputs& a,
-	const SideInputs& b,
+	const std::vector<Regiment>& a_regiments,
+	const std::vector<Regiment>& b_regiments,
 	const Multipliers& mult,
 	double hit_k,
 	int max_rounds,
@@ -220,18 +261,16 @@ static void run_hundred_test(
 ) {
 	const int NUM_TESTS = 100;
 	int a_wins = 0, b_wins = 0, draws = 0;
-	double sum_a_survivors = 0, sum_b_survivors = 0;
+	double sum_a = 0, sum_b = 0;
 
-	for (int test = 1; test <= NUM_TESTS; ++test) {
-		BattleOutcome outcome = run_battle(
-			battlefield_width, a_count, b_count,
-			a, b, mult, hit_k, max_rounds,
-			flank_multiplier, flank_target_mode, vertical_fill_delay, rng
-		);
-		sum_a_survivors += outcome.a_remaining;
-		sum_b_survivors += outcome.b_remaining;
-		if (outcome.a_remaining > 0 && outcome.b_remaining == 0) ++a_wins;
-		else if (outcome.b_remaining > 0 && outcome.a_remaining == 0) ++b_wins;
+	for (int t = 0; t < NUM_TESTS; ++t) {
+		BattleOutcome o = run_battle_multi(
+			battlefield_width, a_regiments, b_regiments,
+			mult, hit_k, max_rounds, flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
+		sum_a += o.a_remaining;
+		sum_b += o.b_remaining;
+		if (o.a_remaining > 0 && o.b_remaining == 0) ++a_wins;
+		else if (o.b_remaining > 0 && o.a_remaining == 0) ++b_wins;
 		else ++draws;
 	}
 
@@ -239,9 +278,9 @@ static void run_hundred_test(
 	std::cout << "== 百次测试结果（" << NUM_TESTS << " 次） ==\n";
 	std::cout << "========================================\n";
 	std::cout << "  A 胜率: " << (a_wins * 100.0 / NUM_TESTS) << "%";
-	std::cout << "  平均残余: " << (sum_a_survivors / NUM_TESTS) << "\n";
+	std::cout << "  平均残余: " << (sum_a / NUM_TESTS) << "\n";
 	std::cout << "  B 胜率: " << (b_wins * 100.0 / NUM_TESTS) << "%";
-	std::cout << "  平均残余: " << (sum_b_survivors / NUM_TESTS) << "\n";
+	std::cout << "  平均残余: " << (sum_b / NUM_TESTS) << "\n";
 	std::cout << "  平局率: " << (draws * 100.0 / NUM_TESTS) << "%\n";
 	std::cout << "========================================\n";
 }
@@ -250,365 +289,305 @@ int main() {
 	std::random_device rd;
 	std::mt19937 rng(rd());
 
-	// 从 data.csv 读取参数
 	std::cout << "\n正在从 data.csv 读取参数...\n";
 	CsvParams csv = read_csv_params("data.csv");
 
+	// 按预期战斗力排序
+	sort_regiments_by_power(csv.side_a_regiments, csv.mult);
+	sort_regiments_by_power(csv.side_b_regiments, csv.mult);
+
 	double hit_k = csv.hit_k;
 	Multipliers mult = csv.mult;
-	int max_rounds = csv.max_rounds;
-	int battlefield_width = csv.battlefield_width;
-	int a_count = csv.a_count;
-	int b_count = csv.b_count;
+	int max_rounds = std::max(1, csv.max_rounds);
+	int battlefield_width = std::max(1, csv.battlefield_width);
 	double flank_multiplier = csv.flank_multiplier;
 	FlankTargetMode flank_target_mode = csv.flank_target_mode;
 	int vertical_fill_delay = csv.vertical_fill_delay;
-	SideInputs a = csv.side_a;
-	SideInputs b = csv.side_b;
 
-	max_rounds = std::max(1, max_rounds);
-	battlefield_width = std::max(1, battlefield_width);
-	a_count = clamp_non_negative(a_count);
-	b_count = clamp_non_negative(b_count);
+	// 用于运行时修改的参数副本
+	std::vector<Regiment> a_regs = csv.side_a_regiments;
+	std::vector<Regiment> b_regs = csv.side_b_regiments;
 
-	std::cout << "已加载 " << a_count + b_count << " 个单位（A=" << a_count << " B=" << b_count << "），战场宽度=" << battlefield_width << "\n";
+	auto print_summary = [&]() {
+		int a_total = total_regiment_count(a_regs);
+		int b_total = total_regiment_count(b_regs);
+		std::cout << "已加载 " << a_total + b_total << " 个单位（A=" << a_total << " B=" << b_total << "），战场宽度=" << battlefield_width << "\n";
+		std::cout << "  A 兵种数=" << a_regs.size() << " B 兵种数=" << b_regs.size() << "\n";
+	};
+	print_summary();
 
-	// ==== 主循环 ====
 	bool keep_running = true;
 	while (keep_running) {
 		std::cout << "\n== 选择操作 ==\n";
 		std::cout << "1) 单次推演（逐回合查看战报）\n";
 		std::cout << "2) 百次测试（快速测试 100 场，输出胜率与平均残余）\n";
 		std::cout << "3) 修改全局参数\n";
-		std::cout << "4) 修改 Side A 参数\n";
-		std::cout << "5) 修改 Side B 参数\n";
-		std::cout << "6) 重新读取 CSV（丢弃内存中的修改）\n";
+		std::cout << "4) 重新读取 CSV（丢弃内存中的修改）\n";
 		std::cout << "0) 退出\n";
 
-		int init_choice = read_int("请选择", 1);
-		if (init_choice == 0) {
-			keep_running = false;
-			break;
-		}
-		if (init_choice == 2) {
-			run_hundred_test(battlefield_width, a_count, b_count,
-				a, b, mult, hit_k, max_rounds,
-				flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
+		int choice = read_int("请选择", 1);
+		if (choice == 0) { keep_running = false; break; }
+
+		if (choice == 2) {
+			run_hundred_test(battlefield_width, a_regs, b_regs,
+				mult, hit_k, max_rounds, flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
 			continue;
 		}
-		if (init_choice == 3) {
-			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode, vertical_fill_delay);
+		if (choice == 3) {
+			edit_global_menu(hit_k, mult, max_rounds, battlefield_width,
+				flank_multiplier, flank_target_mode, vertical_fill_delay);
 			continue;
 		}
-		if (init_choice == 4) {
-			edit_side_menu(a);
-			continue;
-		}
-		if (init_choice == 5) {
-			edit_side_menu(b);
-			continue;
-		}
-		if (init_choice == 6) {
+		if (choice == 4) {
 			std::cout << "重新读取 data.csv...\n";
 			CsvParams csv = read_csv_params("data.csv");
+			sort_regiments_by_power(csv.side_a_regiments, csv.mult);
+			sort_regiments_by_power(csv.side_b_regiments, csv.mult);
 			hit_k = csv.hit_k;
 			mult = csv.mult;
-			max_rounds = csv.max_rounds;
-			battlefield_width = csv.battlefield_width;
-			a_count = csv.a_count;
-			b_count = csv.b_count;
+			max_rounds = std::max(1, csv.max_rounds);
+			battlefield_width = std::max(1, csv.battlefield_width);
 			flank_multiplier = csv.flank_multiplier;
 			flank_target_mode = csv.flank_target_mode;
 			vertical_fill_delay = csv.vertical_fill_delay;
-			a = csv.side_a;
-			b = csv.side_b;
-			max_rounds = std::max(1, max_rounds);
-			battlefield_width = std::max(1, battlefield_width);
-			a_count = clamp_non_negative(a_count);
-			b_count = clamp_non_negative(b_count);
-			std::cout << "已重新加载（A=" << a_count << " B=" << b_count << "，战场宽度=" << battlefield_width << "）\n";
+			a_regs = csv.side_a_regiments;
+			b_regs = csv.side_b_regiments;
+			print_summary();
 			continue;
 		}
 
-		// 默认（含选项 1）：单次推演
+		// ===== 选项 1：单次推演 =====
 		std::cout << "\n== 推演开始 ==\n";
 		std::cout << std::fixed << std::setprecision(4);
 
-		int a_front_count = std::min(battlefield_width, a_count);
-		int b_front_count = std::min(battlefield_width, b_count);
-		std::vector<int> a_positions = centered_positions(battlefield_width, a_front_count);
-		std::vector<int> b_positions = centered_positions(battlefield_width, b_front_count);
-		std::vector<UnitState> a_units = init_units(a, mult, battlefield_width, a_positions);
-		std::vector<UnitState> b_units = init_units(b, mult, battlefield_width, b_positions);
-		std::vector<int> a_backline = build_backline(battlefield_width, a_count);
-		std::vector<int> b_backline = build_backline(battlefield_width, b_count);
+		DeployResult a_deploy = deploy_regiments(a_regs, mult, battlefield_width);
+		DeployResult b_deploy = deploy_regiments(b_regs, mult, battlefield_width);
+		std::vector<UnitState> a_units = std::move(a_deploy.front_units);
+		std::vector<UnitState> b_units = std::move(b_deploy.front_units);
+		std::vector<std::vector<int>> a_backline = std::move(a_deploy.backline_queue);
+		std::vector<std::vector<int>> b_backline = std::move(b_deploy.backline_queue);
 		std::vector<int> a_empty_rounds(battlefield_width, 0);
 		std::vector<int> b_empty_rounds(battlefield_width, 0);
 
+		int a_total_init = total_regiment_count(a_regs);
+		int b_total_init = total_regiment_count(b_regs);
+
 		bool ended_by_elimination = false;
-		int last_a_total = a_count;
-		int last_b_total = b_count;
-		auto backline_total = [](const std::vector<int>& backline) {
-			int total = 0;
-			for (int value : backline) {
-				total += value;
-			}
-			return total;
-		};
-		auto print_outcome = [&](int a_total, int b_total, bool time_up) {
-			if (time_up) {
-				std::cout << "\n== 时间结束 ==\n";
-			}
-			if (a_total == 0 && b_total == 0) {
-				std::cout << "结果：平局（双方死绝）\n";
-			} else if (a_total == 0) {
-				std::cout << "结果：B 胜利\n";
-			} else if (b_total == 0) {
-				std::cout << "结果：A 胜利\n";
-			} else if (a_total > b_total) {
-				std::cout << "结果：A 胜利\n";
-			} else if (b_total > a_total) {
-				std::cout << "结果：B 胜利\n";
-			} else {
-				std::cout << "结果：平局\n";
-			}
-		};
+		int last_a_total = a_total_init, last_b_total = b_total_init;
+
+		auto get_a_inputs = [&](int reg_idx) -> const SideInputs& { return a_regs[reg_idx].stats; };
+		auto get_b_inputs = [&](int reg_idx) -> const SideInputs& { return b_regs[reg_idx].stats; };
+
+		// 兵种战损追踪
+		std::vector<RegimentReport> a_reports, b_reports;
+		for (int r = 0; r < static_cast<int>(a_regs.size()); ++r)
+			a_reports.push_back({ "A#" + std::to_string(r + 1), a_regs[r].count, 0, 0.0 });
+		for (int r = 0; r < static_cast<int>(b_regs.size()); ++r)
+			b_reports.push_back({ "B#" + std::to_string(r + 1), b_regs[r].count, 0, 0.0 });
 
 		for (int round = 1; round <= max_rounds; ++round) {
-			// 纵向补位：空位持续两回合后由后排补入
+			// ----- 纵向补位 -----
 			auto apply_vertical_fill = [&](
 				std::vector<UnitState>& units,
-				std::vector<int>& backline,
+				std::vector<std::vector<int>>& backline,
 				std::vector<int>& empty_rounds,
-				const SideInputs& s
+				const std::vector<Regiment>& regs
 			) {
 				for (int i = 0; i < static_cast<int>(units.size()); ++i) {
-					if (is_alive(units[i])) {
-						empty_rounds[i] = 0;
-						continue;
-					}
+					if (is_alive(units[i])) { empty_rounds[i] = 0; continue; }
 					empty_rounds[i] += 1;
-					if (empty_rounds[i] >= vertical_fill_delay && backline[i] > 0) {
-						units[i] = initial_unit_state(s, mult);
+					if (empty_rounds[i] >= vertical_fill_delay && !backline[i].empty()) {
+						int reg_idx = backline[i].front();
+						backline[i].erase(backline[i].begin());
+						units[i] = initial_unit_state(regs[reg_idx].stats, mult, reg_idx);
 						units[i].hp *= 0.8;
-						backline[i] -= 1;
 						empty_rounds[i] = 0;
 					}
 				}
 			};
+			apply_vertical_fill(a_units, a_backline, a_empty_rounds, a_regs);
+			apply_vertical_fill(b_units, b_backline, b_empty_rounds, b_regs);
 
-			apply_vertical_fill(a_units, a_backline, a_empty_rounds, a);
-			apply_vertical_fill(b_units, b_backline, b_empty_rounds, b);
-
-			// 横向补位：回合开始时正面无敌军，优先向中轴线一侧补位
-			apply_lateral_fill(
-				a_units,
-				b_units
-			);
-			apply_lateral_fill(
-				b_units,
-				a_units
-			);
+			// ----- 横向补位 -----
+			apply_lateral_fill(a_units, b_units);
+			apply_lateral_fill(b_units, a_units);
 			std::string a_after_fill = alive_line(a_units);
 			std::string b_after_fill = alive_line(b_units);
 
+			// 快照
 			std::vector<bool> a_alive_before(battlefield_width, false);
 			std::vector<bool> b_alive_before(battlefield_width, false);
-			std::vector<double> a_hp_before_damage(battlefield_width, 0.0);
-			std::vector<double> b_hp_before_damage(battlefield_width, 0.0);
+			std::vector<double> a_hp_before(battlefield_width, 0.0);
+			std::vector<double> b_hp_before(battlefield_width, 0.0);
 			for (int i = 0; i < battlefield_width; ++i) {
 				a_alive_before[i] = is_alive(a_units[i]);
 				b_alive_before[i] = is_alive(b_units[i]);
-				a_hp_before_damage[i] = a_units[i].hp;
-				b_hp_before_damage[i] = b_units[i].hp;
+				a_hp_before[i] = a_units[i].hp;
+				b_hp_before[i] = b_units[i].hp;
 			}
 
 			std::vector<RoundResult> a_to_b(battlefield_width);
 			std::vector<RoundResult> b_to_a(battlefield_width);
 			std::vector<bool> engaged(battlefield_width, false);
 
-			// 同位 1v1 互砍
+			// ----- 1v1 -----
 			for (int i = 0; i < battlefield_width; ++i) {
-				if (is_alive(a_units[i]) && is_alive(b_units[i])) {
-					a_to_b[i] = simulate_round(a, b, mult, hit_k, round, b_units[i].battle_loss_accum, rng);
-					b_to_a[i] = simulate_round(b, a, mult, hit_k, round, a_units[i].battle_loss_accum, rng);
-					engaged[i] = true;
-				}
+				if (!is_alive(a_units[i]) || !is_alive(b_units[i])) continue;
+				engaged[i] = true;
+				int a_reg = a_units[i].regiment_idx;
+				int b_reg = b_units[i].regiment_idx;
+				const SideInputs& a_s = get_a_inputs(a_reg);
+				const SideInputs& b_s = get_b_inputs(b_reg);
+				a_to_b[i] = simulate_round(a_s, b_s, mult, hit_k, round, b_units[i].battle_loss_accum, rng);
+				b_to_a[i] = simulate_round(b_s, a_s, mult, hit_k, round, a_units[i].battle_loss_accum, rng);
 			}
-
-			// 结算同位伤害
 			for (int i = 0; i < battlefield_width; ++i) {
-				if (!engaged[i]) {
-					continue;
-				}
+				if (!engaged[i]) continue;
+				int a_reg = a_units[i].regiment_idx;
+				int b_reg = b_units[i].regiment_idx;
 				b_units[i].hp -= a_to_b[i].damage_taken;
 				if (b_units[i].hp < 0.0) b_units[i].hp = 0.0;
 				a_units[i].hp -= b_to_a[i].damage_taken;
 				if (a_units[i].hp < 0.0) a_units[i].hp = 0.0;
-
-				b_units[i].battle_loss_accum += a_to_b[i].damage_taken * b.battle_loss_factor;
-				a_units[i].battle_loss_accum += b_to_a[i].damage_taken * a.battle_loss_factor;
+				b_units[i].battle_loss_accum += a_to_b[i].damage_taken * get_b_inputs(b_reg).battle_loss_factor;
+				a_units[i].battle_loss_accum += b_to_a[i].damage_taken * get_a_inputs(a_reg).battle_loss_factor;
+				if (a_reg >= 0 && a_reg < static_cast<int>(a_reports.size()))
+					a_reports[a_reg].damage_dealt += a_to_b[i].damage_taken;
+				if (b_reg >= 0 && b_reg < static_cast<int>(b_reports.size()))
+					b_reports[b_reg].damage_dealt += b_to_a[i].damage_taken;
 			}
 
-			struct FlankAttack {
-				bool attacker_is_a = true;
-				int attacker_index = -1;
-				int target_index = -1;
-				int distance = 0;
-				RoundResult result;
-			};
+			// ----- 夹击 -----
+			struct FlankRec { bool is_a; int src; int dst; int dist; RoundResult res; };
+			std::vector<FlankRec> flanks;
 
-			// 夹击触发：回合开始时正面为空，且左右任一侧存在敌军
-			std::vector<FlankAttack> flanks;
-			auto has_adjacent_before = [&](const std::vector<bool>& alive_before, int index) {
-				for (int i = index - 1; i >= 0; --i) {
-					if (alive_before[i]) return true;
-				}
-				for (int i = index + 1; i < static_cast<int>(alive_before.size()); ++i) {
-					if (alive_before[i]) return true;
-				}
+			auto has_adj = [&](const std::vector<bool>& alive_before, int idx) {
+				for (int j = idx - 1; j >= 0; --j) if (alive_before[j]) return true;
+				for (int j = idx + 1; j < battlefield_width; ++j) if (alive_before[j]) return true;
 				return false;
 			};
-			auto pick_target = [&](
-				const std::vector<UnitState>& defenders,
-				const SideInputs& defender_inputs,
-				int index
-			) {
-				auto is_alive_index = [&](int idx) {
-					return idx >= 0 && idx < static_cast<int>(defenders.size()) && defenders[idx].hp > 0.0;
-				};
-
-				int left_pick = -1;
-				int right_pick = -1;
-				int left_dist = 0;
-				int right_dist = 0;
-				for (int i = index - 1; i >= 0; --i) {
-					if (is_alive_index(i)) {
-						left_pick = i;
-						left_dist = index - i;
-						break;
-					}
-				}
-				for (int i = index + 1; i < static_cast<int>(defenders.size()); ++i) {
-					if (is_alive_index(i)) {
-						right_pick = i;
-						right_dist = i - index;
-						break;
-					}
-				}
-
-				if (left_pick < 0 && right_pick < 0) return -1;
-				if (left_pick >= 0 && right_pick < 0) return left_pick;
-				if (left_pick < 0 && right_pick >= 0) return right_pick;
-
-				if (left_dist < right_dist) return left_pick;
-				if (right_dist < left_dist) return right_pick;
-
+			auto pick_target = [&](const std::vector<UnitState>& defs, const std::vector<Regiment>& def_regs, int idx) {
+				auto alive_idx = [&](int j) { return j >= 0 && j < battlefield_width && defs[j].hp > 0.0; };
+				int lp = -1, rp = -1, ld = 0, rd = 0;
+				for (int j = idx - 1; j >= 0; --j) if (alive_idx(j)) { lp = j; ld = idx - j; break; }
+				for (int j = idx + 1; j < battlefield_width; ++j) if (alive_idx(j)) { rp = j; rd = j - idx; break; }
+				if (lp < 0 && rp < 0) return -1;
+				if (lp >= 0 && rp < 0) return lp;
+				if (lp < 0 && rp >= 0) return rp;
+				if (ld < rd) return lp;
+				if (rd < ld) return rp;
 				if (flank_target_mode == FlankTargetMode::Morale) {
-					double left_morale = unit_morale(defender_inputs, mult, round, defenders[left_pick]);
-					double right_morale = unit_morale(defender_inputs, mult, round, defenders[right_pick]);
-					return (left_morale <= right_morale) ? left_pick : right_pick;
+					double lm = unit_morale(get_side_inputs(def_regs, defs[lp].regiment_idx), mult, round, defs[lp]);
+					double rm = unit_morale(get_side_inputs(def_regs, defs[rp].regiment_idx), mult, round, defs[rp]);
+					return (lm <= rm) ? lp : rp;
 				}
-
-				return (defenders[left_pick].hp <= defenders[right_pick].hp) ? left_pick : right_pick;
+				return (defs[lp].hp <= defs[rp].hp) ? lp : rp;
 			};
 
 			for (int i = 0; i < battlefield_width; ++i) {
-				if (a_alive_before[i] && !b_alive_before[i] && has_adjacent_before(b_alive_before, i)) {
-					int target = pick_target(b_units, b, i);
-					if (target >= 0) {
-						FlankAttack flank;
-						flank.attacker_is_a = true;
-						flank.attacker_index = i;
-						flank.target_index = target;
-						flank.distance = std::abs(target - i);
-						flank.result = simulate_round(a, b, mult, hit_k, round, b_units[target].battle_loss_accum, rng);
-						flank.result.damage_taken *= flank_damage_multiplier(flank_multiplier, flank.distance);
-						flanks.push_back(flank);
+				if (a_alive_before[i] && !b_alive_before[i] && has_adj(b_alive_before, i)) {
+					int t = pick_target(b_units, b_regs, i);
+					if (t >= 0) {
+						int a_reg = a_units[i].regiment_idx;
+						int b_reg = b_units[t].regiment_idx;
+						const SideInputs& a_s = get_a_inputs(a_reg);
+						const SideInputs& b_s = get_b_inputs(b_reg);
+						RoundResult res = simulate_round(a_s, b_s, mult, hit_k, round, b_units[t].battle_loss_accum, rng);
+						res.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(t - i));
+						flanks.push_back({ true, i, t, std::abs(t - i), res });
 					}
 				}
-				if (b_alive_before[i] && !a_alive_before[i] && has_adjacent_before(a_alive_before, i)) {
-					int target = pick_target(a_units, a, i);
-					if (target >= 0) {
-						FlankAttack flank;
-						flank.attacker_is_a = false;
-						flank.attacker_index = i;
-						flank.target_index = target;
-						flank.distance = std::abs(target - i);
-						flank.result = simulate_round(b, a, mult, hit_k, round, a_units[target].battle_loss_accum, rng);
-						flank.result.damage_taken *= flank_damage_multiplier(flank_multiplier, flank.distance);
-						flanks.push_back(flank);
+				if (b_alive_before[i] && !a_alive_before[i] && has_adj(a_alive_before, i)) {
+					int t = pick_target(a_units, a_regs, i);
+					if (t >= 0) {
+						int b_reg = b_units[i].regiment_idx;
+						int a_reg = a_units[t].regiment_idx;
+						const SideInputs& b_s = get_b_inputs(b_reg);
+						const SideInputs& a_s = get_a_inputs(a_reg);
+						RoundResult res = simulate_round(b_s, a_s, mult, hit_k, round, a_units[t].battle_loss_accum, rng);
+						res.damage_taken *= flank_damage_multiplier(flank_multiplier, std::abs(t - i));
+						flanks.push_back({ false, i, t, std::abs(t - i), res });
 					}
 				}
 			}
 
 			int flank_hits = 0;
-			// 结算夹击伤害
-			for (const auto& flank : flanks) {
-				if (flank.attacker_is_a) {
-					b_units[flank.target_index].hp -= flank.result.damage_taken;
-					if (b_units[flank.target_index].hp < 0.0) b_units[flank.target_index].hp = 0.0;
-					b_units[flank.target_index].battle_loss_accum += flank.result.damage_taken * b.battle_loss_factor;
+			for (const auto& f : flanks) {
+				if (f.is_a) {
+					int b_reg = b_units[f.dst].regiment_idx;
+					int a_reg = a_units[f.src].regiment_idx;
+					b_units[f.dst].hp -= f.res.damage_taken;
+					if (b_units[f.dst].hp < 0.0) b_units[f.dst].hp = 0.0;
+					b_units[f.dst].battle_loss_accum += f.res.damage_taken * get_b_inputs(b_reg).battle_loss_factor;
+					if (a_reg >= 0 && a_reg < static_cast<int>(a_reports.size()))
+						a_reports[a_reg].damage_dealt += f.res.damage_taken;
 				} else {
-					a_units[flank.target_index].hp -= flank.result.damage_taken;
-					if (a_units[flank.target_index].hp < 0.0) a_units[flank.target_index].hp = 0.0;
-					a_units[flank.target_index].battle_loss_accum += flank.result.damage_taken * a.battle_loss_factor;
+					int a_reg = a_units[f.dst].regiment_idx;
+					int b_reg = b_units[f.src].regiment_idx;
+					a_units[f.dst].hp -= f.res.damage_taken;
+					if (a_units[f.dst].hp < 0.0) a_units[f.dst].hp = 0.0;
+					a_units[f.dst].battle_loss_accum += f.res.damage_taken * get_a_inputs(a_reg).battle_loss_factor;
+					if (b_reg >= 0 && b_reg < static_cast<int>(b_reports.size()))
+						b_reports[b_reg].damage_dealt += f.res.damage_taken;
 				}
-				if (flank.result.hit) {
-					++flank_hits;
-				}
+				if (f.res.hit) ++flank_hits;
 			}
-			std::string a_after_damage = alive_line(a_units);
-			std::string b_after_damage = alive_line(b_units);
 
-			std::vector<int> a_new_dead;
-			std::vector<int> b_new_dead;
+			// 阵亡统计
 			for (int i = 0; i < battlefield_width; ++i) {
 				if (a_alive_before[i] && !is_alive(a_units[i])) {
-					a_new_dead.push_back(i + 1);
+					int r = a_units[i].regiment_idx;
+					if (r >= 0 && r < static_cast<int>(a_reports.size())) a_reports[r].deaths += 1;
 				}
 				if (b_alive_before[i] && !is_alive(b_units[i])) {
-					b_new_dead.push_back(i + 1);
+					int r = b_units[i].regiment_idx;
+					if (r >= 0 && r < static_cast<int>(b_reports.size())) b_reports[r].deaths += 1;
 				}
 			}
+
+			std::string a_after = alive_line(a_units);
+			std::string b_after = alive_line(b_units);
+
+			// ===== 回合战报 =====
+			std::vector<int> a_new_dead, b_new_dead;
+			for (int i = 0; i < battlefield_width; ++i) {
+				if (a_alive_before[i] && !is_alive(a_units[i])) a_new_dead.push_back(i + 1);
+				if (b_alive_before[i] && !is_alive(b_units[i])) b_new_dead.push_back(i + 1);
+			}
+
+			int a_front = count_alive(a_units);
+			int b_front = count_alive(b_units);
+			int a_bl = backline_queue_total(a_backline);
+			int b_bl = backline_queue_total(b_backline);
+			last_a_total = a_front + a_bl;
+			last_b_total = b_front + b_bl;
 
 			std::cout << "\n-- 第 " << round << " 回合战报 --\n";
-			int a_front_alive = count_alive(a_units);
-			int b_front_alive = count_alive(b_units);
-			int a_backline_alive = backline_total(a_backline);
-			int b_backline_alive = backline_total(b_backline);
-			last_a_total = a_front_alive + a_backline_alive;
-			last_b_total = b_front_alive + b_backline_alive;
-			std::cout << "A 存活=" << last_a_total << " / " << a_count << "\n";
-			std::cout << "B 存活=" << last_b_total << " / " << b_count << "\n";
-			std::cout << "A 后排待命=" << a_backline_alive << "\n";
-			std::cout << "B 后排待命=" << b_backline_alive << "\n";
+			std::cout << "A 存活=" << last_a_total << " / " << a_total_init << "\n";
+			std::cout << "B 存活=" << last_b_total << " / " << b_total_init << "\n";
+			std::cout << "A 后排待命=" << a_bl << "\n";
+			std::cout << "B 后排待命=" << b_bl << "\n";
 			std::cout << "补位后 A=" << a_after_fill << "\n";
 			std::cout << "补位后 B=" << b_after_fill << "\n";
-			std::cout << "结算后 A=" << a_after_damage << "\n";
-			std::cout << "结算后 B=" << b_after_damage << "\n";
-			if (a_new_dead.empty()) {
-				std::cout << "A 本回合无人阵亡\n";
-			} else {
-				std::cout << "A 本回合阵亡位置：";
-				for (size_t i = 0; i < a_new_dead.size(); ++i) {
-					if (i > 0) std::cout << "、";
-					std::cout << a_new_dead[i];
-				}
-				std::cout << "\n";
-			}
-			if (b_new_dead.empty()) {
-				std::cout << "B 本回合无人阵亡\n";
-			} else {
-				std::cout << "B 本回合阵亡位置：";
-				for (size_t i = 0; i < b_new_dead.size(); ++i) {
-					if (i > 0) std::cout << "、";
-					std::cout << b_new_dead[i];
-				}
-				std::cout << "\n";
-			}
-			std::cout << "夹击次数=" << flanks.size() << " 命中=" << flank_hits << " 倍率=" << flank_multiplier << "（距离越远伤害越低）\n";
+			std::cout << "结算后 A=" << a_after << "\n";
+			std::cout << "结算后 B=" << b_after << "\n";
 
+			auto print_dead = [](const std::string& side, const std::vector<int>& dead) {
+				if (dead.empty()) std::cout << side << " 本回合无人阵亡\n";
+				else {
+					std::cout << side << " 本回合阵亡位置：";
+					for (size_t i = 0; i < dead.size(); ++i) {
+						if (i > 0) std::cout << "、";
+						std::cout << dead[i];
+					}
+					std::cout << "\n";
+				}
+			};
+			print_dead("A", a_new_dead);
+			print_dead("B", b_new_dead);
+			std::cout << "夹击次数=" << flanks.size() << " 命中=" << flank_hits << " 倍率=" << flank_multiplier << "\n";
+
+			// 位置详情
 			std::cout << "\n如需查看位置详情，输入位置编号（空格分隔，1-" << battlefield_width << "），直接回车跳过：";
 			std::string detail_line;
 			std::getline(std::cin, detail_line);
@@ -616,55 +595,43 @@ int main() {
 			for (int idx : detail_indices) {
 				std::cout << "\n== 位置 " << (idx + 1) << " 详细战报 ==\n";
 				if (engaged[idx]) {
-					std::cout << "A -> B\n";
-					std::cout << "  B 受伤前血量:      " << b_hp_before_damage[idx] << "\n";
+					int a_reg = a_units[idx].regiment_idx;
+					int b_reg = b_units[idx].regiment_idx;
+					std::cout << "A[兵种" << (a_reg + 1) << "] -> B[兵种" << (b_reg + 1) << "]\n";
+					std::cout << "  B 受伤前血量:      " << b_hp_before[idx] << "\n";
 					std::cout << "  基础伤害:          " << a_to_b[idx].base_damage << "\n";
-					std::cout << "  命中率:            " << a_to_b[idx].hit_chance * 100.0 << "%\n";
+					std::cout << "  命中率:            " << (a_to_b[idx].hit_chance * 100.0) << "%\n";
 					std::cout << "  防御乘数:          " << a_to_b[idx].defense_multiplier << "\n";
 					std::cout << "  命中判定:          " << (a_to_b[idx].hit ? "命中" : "未命中") << "\n";
 					std::cout << "  防御判定:          " << a_to_b[idx].defense_tier << "\n";
 					std::cout << "  实际承受伤害:      " << a_to_b[idx].damage_taken << "\n";
 					std::cout << "  B 血量:            " << b_units[idx].hp << "\n";
 
-					std::cout << "B -> A\n";
-					std::cout << "  A 受伤前血量:      " << a_hp_before_damage[idx] << "\n";
+					std::cout << "B[兵种" << (b_reg + 1) << "] -> A[兵种" << (a_reg + 1) << "]\n";
+					std::cout << "  A 受伤前血量:      " << a_hp_before[idx] << "\n";
 					std::cout << "  基础伤害:          " << b_to_a[idx].base_damage << "\n";
-					std::cout << "  命中率:            " << b_to_a[idx].hit_chance * 100.0 << "%\n";
+					std::cout << "  命中率:            " << (b_to_a[idx].hit_chance * 100.0) << "%\n";
 					std::cout << "  防御乘数:          " << b_to_a[idx].defense_multiplier << "\n";
 					std::cout << "  命中判定:          " << (b_to_a[idx].hit ? "命中" : "未命中") << "\n";
 					std::cout << "  防御判定:          " << b_to_a[idx].defense_tier << "\n";
 					std::cout << "  实际承受伤害:      " << b_to_a[idx].damage_taken << "\n";
 					std::cout << "  A 血量:            " << a_units[idx].hp << "\n";
-				} else if (is_alive(a_units[idx]) && !is_alive(b_units[idx])) {
+				} else if (is_alive(a_units[idx]) && !is_alive(b_units[idx]))
 					std::cout << "B 已被击溃，A 待命\n";
-				} else if (!is_alive(a_units[idx]) && is_alive(b_units[idx])) {
+				else if (!is_alive(a_units[idx]) && is_alive(b_units[idx]))
 					std::cout << "A 已被击溃，B 待命\n";
-				} else {
+				else
 					std::cout << "双方已空\n";
-				}
 
-				bool has_flank = false;
-				for (const auto& flank : flanks) {
-					if (flank.attacker_index == idx || flank.target_index == idx) {
-						if (!has_flank) {
-							std::cout << "夹击记录\n";
-							has_flank = true;
-						}
-						if (flank.attacker_is_a) {
-							std::cout << "A[" << (flank.attacker_index + 1) << "] -> B[" << (flank.target_index + 1) << "]\n";
-						} else {
-							std::cout << "B[" << (flank.attacker_index + 1) << "] -> A[" << (flank.target_index + 1) << "]\n";
-						}
-						double final_multiplier = flank_damage_multiplier(flank_multiplier, flank.distance);
-						std::cout << "  夹击距离:          " << flank.distance << "\n";
-						std::cout << "  最终倍率:          " << final_multiplier << "\n";
-						std::cout << "  基础伤害:          " << flank.result.base_damage << "\n";
-						std::cout << "  命中率:            " << flank.result.hit_chance * 100.0 << "%\n";
-						std::cout << "  防御乘数:          " << flank.result.defense_multiplier << "\n";
-						std::cout << "  命中判定:          " << (flank.result.hit ? "命中" : "未命中") << "\n";
-						std::cout << "  防御判定:          " << flank.result.defense_tier << "\n";
-						std::cout << "  实际承受伤害:      " << flank.result.damage_taken << "\n";
-					}
+				for (const auto& f : flanks) {
+					if (f.src != idx && f.dst != idx) continue;
+					if (f.is_a)
+						std::cout << "夹击 A[" << (f.src + 1) << "] -> B[" << (f.dst + 1) << "]\n";
+					else
+						std::cout << "夹击 B[" << (f.src + 1) << "] -> A[" << (f.dst + 1) << "]\n";
+					double fm = flank_damage_multiplier(flank_multiplier, f.dist);
+					std::cout << "  距离=" << f.dist << " 最终倍率=" << fm
+						<< " 伤害=" << f.res.damage_taken << " 命中=" << (f.res.hit ? "是" : "否") << "\n";
 				}
 			}
 
@@ -674,48 +641,39 @@ int main() {
 				ended_by_elimination = true;
 				break;
 			}
-
 			std::cout << "\n按回车继续下一回合...";
-			std::string wait_line;
-			std::getline(std::cin, wait_line);
+			std::string _;
+			std::getline(std::cin, _);
 		}
 
-		if (!ended_by_elimination) {
-			print_outcome(last_a_total, last_b_total, true);
-		}
+		if (!ended_by_elimination) print_outcome(last_a_total, last_b_total, true);
+
+		// 兵种战报
+		print_regiment_reports("Side A", a_regs, a_reports);
+		print_regiment_reports("Side B", b_regs, b_reports);
+
 		std::cout << "\n== 推演结束 ==\n";
+
+		// 后续操作
 		std::cout << "\n== 后续操作 ==\n";
 		std::cout << "1) 直接再次推演\n";
-		std::cout << "2) 百次测试（快速测试 100 场，输出胜率与平均残余）\n";
+		std::cout << "2) 百次测试\n";
 		std::cout << "3) 修改全局参数\n";
-		std::cout << "4) 修改 Side A 参数\n";
-		std::cout << "5) 修改 Side B 参数\n";
 		std::cout << "0) 退出\n";
 
-		int choice = read_int("请选择", 1);
-		switch (choice) {
-		case 1:
-			break;
+		int next = read_int("请选择", 1);
+		switch (next) {
+		case 1: break;
 		case 2:
-			run_hundred_test(battlefield_width, a_count, b_count,
-				a, b, mult, hit_k, max_rounds,
-				flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
+			run_hundred_test(battlefield_width, a_regs, b_regs,
+				mult, hit_k, max_rounds, flank_multiplier, flank_target_mode, vertical_fill_delay, rng);
 			break;
 		case 3:
-			edit_global_menu(hit_k, mult, max_rounds, battlefield_width, a_count, b_count, flank_multiplier, flank_target_mode, vertical_fill_delay);
+			edit_global_menu(hit_k, mult, max_rounds, battlefield_width,
+				flank_multiplier, flank_target_mode, vertical_fill_delay);
 			break;
-		case 4:
-			edit_side_menu(a);
-			break;
-		case 5:
-			edit_side_menu(b);
-			break;
-		case 0:
-			keep_running = false;
-			break;
-		default:
-			std::cout << "无效选项，默认再次推演。\n";
-			break;
+		case 0: keep_running = false; break;
+		default: std::cout << "无效选项。\n"; break;
 		}
 	}
 

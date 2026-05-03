@@ -71,6 +71,21 @@ double unit_morale(const SideInputs& s, const Multipliers& m, int round, const U
 	return calc_morale(s, m, round, u.battle_loss_accum);
 }
 
+// 预期战斗力 = 基础伤害 × 初始血量
+double calc_expected_power(const SideInputs& s, const Multipliers& m) {
+	double base_dmg = calc_base_damage(s.attack, s.training, s.full_rate, m.battle_type);
+	double morale = calc_morale(s, m, 0, 0.0);
+	double hp = calc_hp(morale, s);
+	return base_dmg * hp;
+}
+
+void sort_regiments_by_power(std::vector<Regiment>& regiments, const Multipliers& m) {
+	std::sort(regiments.begin(), regiments.end(),
+		[&](const Regiment& a, const Regiment& b) {
+			return calc_expected_power(a.stats, m) > calc_expected_power(b.stats, m);
+		});
+}
+
 bool is_alive(const UnitState& u) {
 	return u.hp > 0.0;
 }
@@ -85,26 +100,20 @@ int count_alive(const std::vector<UnitState>& units) {
 	return count;
 }
 
-std::vector<UnitState> init_units(
-	const SideInputs& s,
-	const Multipliers& m,
-	int width,
-	const std::vector<int>& positions
-) {
-	std::vector<UnitState> units(width);
-	for (int idx : positions) {
-		if (idx >= 0 && idx < width) {
-			units[idx] = initial_unit_state(s, m);
-		}
+int total_regiment_count(const std::vector<Regiment>& regiments) {
+	int total = 0;
+	for (const auto& r : regiments) {
+		total += r.count;
 	}
-	return units;
+	return total;
 }
 
-UnitState initial_unit_state(const SideInputs& s, const Multipliers& m) {
+UnitState initial_unit_state(const SideInputs& s, const Multipliers& m, int regiment_idx) {
 	UnitState state;
 	double morale = calc_morale(s, m, 0, 0.0);
 	state.hp = calc_hp(morale, s);
 	state.battle_loss_accum = 0.0;
+	state.regiment_idx = regiment_idx;
 	return state;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 struct SideInputs {
 	std::string name;
@@ -14,6 +15,12 @@ struct SideInputs {
 	double base_morale = 100.0;
 	double time_loss_per_round = 1.0;
 	double battle_loss_factor = 0.1; // 战中损耗系数（每点伤害）
+};
+
+// 一个兵种 = 完整数值 + 队伍数量
+struct Regiment {
+	SideInputs stats;
+	int count = 0;
 };
 
 struct Multipliers {
@@ -35,6 +42,15 @@ struct RoundResult {
 struct UnitState {
 	double hp = 0.0;
 	double battle_loss_accum = 0.0;
+	int regiment_idx = -1;  // 属于哪个兵种
+};
+
+// 兵种战斗统计（用于最终战报）
+struct RegimentReport {
+	std::string label;
+	int initial_count = 0;
+	int deaths = 0;
+	double damage_dealt = 0.0;  // 对敌方造成的总伤害
 };
 
 // 夹击目标偏好
